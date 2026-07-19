@@ -1,0 +1,45 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 环境变量和敏感配置
+.env
+.env.*
+!.env.example
+
+# IDE 配置
+.idea/
+.vscode/
+*.iml
+
+# 日志与运行时文件
+logs/
+*.log
+*.pid
+
+# 爬虫生成的数据
+results/
+output/
+data/
+
+# 测试与代码检查缓存
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
