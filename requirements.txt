@@ -3,3 +3,4 @@
 aiohttp==3.13.5
 motor==3.7.1
 pymongo==4.17.0
+python-dotenv==1.0.1
