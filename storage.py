@@ -5,6 +5,8 @@ from bson.errors import BSONError
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
+logger = logging.getLogger(__name__)
+
 
 class MongoStorage:
 
@@ -31,20 +33,20 @@ class MongoStorage:
                 {"$set": {"updated_at": now}},
             )
 
-            logging.info("MongoDB unique id index is ready")
+            logger.info("MongoDB unique id index is ready")
             return True
         except PyMongoError:
-            logging.exception("failed to initialize MongoDB indexes")
+            logger.exception("failed to initialize MongoDB indexes")
             return False
 
     async def save_data(self, data):
         if not isinstance(data, dict):
-            logging.error("cannot save non-dict data")
+            logger.error("cannot save non-dict data")
             return False
 
         book_id = data.get("id")
         if book_id is None:
-            logging.error("cannot save data without id")
+            logger.error("cannot save data without id")
             return False
 
         document = dict(data)
@@ -68,16 +70,12 @@ class MongoStorage:
                 },
                 upsert=True,
             )
-            logging.info("save data id: %s", book_id)
+            logger.info("save data id: %s", book_id)
             return True
         except (PyMongoError, BSONError):
-            logging.error("failed to save data id: %s", book_id)
+            logger.exception("failed to save data id: %s", book_id)
             return False
 
     def close(self):
         self.client.close()
-        logging.info("MongoDB client closed")
-
-
-
-
+        logger.info("MongoDB client closed")
