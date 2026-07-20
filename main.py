@@ -1,9 +1,11 @@
 import asyncio
-import json
 import logging
+import time
 
 import aiohttp
+from bson.errors import BSONError
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import PyMongoError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,7 +13,7 @@ logging.basicConfig(
 )
 
 
-INDEX_URL = "https://spa5.scrape.center/api/book/?limit=18&offset={offset}"
+INDEX_URL = "https://spa5.scrape.center/api/book/?limit={limit}&offset={offset}"
 DETAIL_URL = "https://spa5.scrape.center/api/book/{id}/"
 PAGE_SIZE = 18
 PAGE_NUMBER = 2
@@ -21,63 +23,120 @@ MONGO_URI = "mongodb://127.0.0.1:27017"
 MONGO_DATABASE = "spider_center"
 MONGO_COLLECTION = "spa5_books1"
 
-client = AsyncIOMotorClient(MONGO_URI)
-db = client[MONGO_DATABASE]
-collection = db[MONGO_COLLECTION]
 
-
-async def scrape_api(url, session: aiohttp.ClientSession, semaphore):
+async def scrape_api(url, session, semaphore):
     async with semaphore:
         try:
             logging.info("scrape %s", url)
             async with session.get(url=url) as response:
+                response.raise_for_status()
                 return await response.json()
-        except aiohttp.ClientError as e:
-            logging.error("error: %s occurred while scraping %s", e, url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            logging.error("error: %s occurred while scraping %s", error, url)
+            return None
 
-async def scrape_index(page, session: aiohttp.ClientSession, semaphore):
-    url = INDEX_URL.format(offset=18 * (page - 1))
+
+async def scrape_index(page, session, semaphore):
+    offset = PAGE_SIZE * (page - 1)
+    url = INDEX_URL.format(limit=PAGE_SIZE, offset=offset)
     return await scrape_api(url, session, semaphore)
 
-async def scrape_detail(book_id, session: aiohttp.ClientSession, semaphore):
-    url = DETAIL_URL.format(id=book_id)
-    data = await scrape_api(url, session, semaphore)
-    await save_data(data)
 
-async def save_data(data):
-    if data:
-        book_id = data.get("id")
-        logging.info("save data id: %s", book_id)
+async def save_data(data, collection):
+    book_id = data.get("id")
+    if book_id is None:
+        logging.info("skip data without id")
+        return False
+
+    try:
         await collection.update_one(
             {"id": book_id},
             {"$set": data},
             upsert=True,
         )
+        logging.info("save data id: %s", book_id)
+        return True
+    except (PyMongoError, BSONError):
+        logging.error("failed to save data id: %s", book_id)
+        return False
+
+
+async def scrape_detail(book_id, session, semaphore, collection, stats):
+    url = DETAIL_URL.format(id=book_id)
+    data = await scrape_api(url, session, semaphore)
+
+    if not isinstance(data, dict):
+        stats["detail_failed"] += 1
+        return
+
+    stats["detail_success"] += 1
+    if await save_data(data, collection):
+        stats["saved"] += 1
+    else:
+        stats["save_failed"] += 1
+
 
 async def main():
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    async with aiohttp.ClientSession() as session:
-        scrape_index_tasks = [
-            scrape_index(page, session, semaphore) for page in range(1, PAGE_NUMBER + 1)
-        ]
-        results = await asyncio.gather(*scrape_index_tasks)
-        logging.info(
-            "results: %s",
-            json.dumps(results, indent=2, ensure_ascii=False)
-        )
+    started_at =    time.perf_counter()
+    stats = {
+        "index_success": 0,
+        "index_failed": 0,
+        "detail_success": 0,
+        "detail_failed": 0,
+        "saved": 0,
+        "save_failed": 0,
+    }
 
-        ids = []
-        for result in results:
-            if not result or "results" not in result:
-                continue
+    client = AsyncIOMotorClient(MONGO_URI)
 
-            for item in result["results"]:
-                ids.append(item.get("id"))
+    try:
+        db = client[MONGO_DATABASE]
+        collection = db[MONGO_COLLECTION]
 
-        scrape_detail_tasks = [scrape_detail(book_id, session, semaphore) for book_id in ids]
-        await asyncio.gather(*scrape_detail_tasks)
+        semaphore = asyncio.Semaphore(CONCURRENCY)
 
+        async with aiohttp.ClientSession() as session:
+            index_tasks = [
+                scrape_index(page, session, semaphore) for page in range(1, PAGE_NUMBER + 1)
+            ]
+            index_results = await asyncio.gather(*index_tasks)
+
+            books_ids = set()
+            for result in index_results:
+                if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+                    stats["index_failed"] += 1
+                    logging.warning("index response is missing a valid results list")
+                    continue
+
+                stats["index_success"] += 1
+                for item in result["results"]:
+                    if not isinstance(item, dict):
+                        continue
+                    book_id = item.get("id")
+                    if book_id is not None:
+                        books_ids.add(book_id)
+
+            logging.info("collected %d unique books ids", len(books_ids))
+
+            detail_tasks = [
+                scrape_detail(book_id, session, semaphore, collection, stats)
+                for book_id in books_ids
+            ]
+            await asyncio.gather(*detail_tasks)
+    finally:
         client.close()
+        elapsed = time.perf_counter() - started_at
+        logging.info(
+            "summary | elapsed=%.2fs | index_success=%d | index_failed=%d | "
+            "detail_success=%d | detail_failed=%d | saved=%d | save_failed=%d",
+            elapsed,
+            stats["index_success"],
+            stats["index_failed"],
+            stats["detail_success"],
+            stats["detail_failed"],
+            stats["saved"],
+            stats["save_failed"],
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())
