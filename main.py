@@ -33,6 +33,9 @@ PAGE_SIZE = 18
 PAGE_NUMBER = 2
 CONCURRENCY = 5
 
+DETAIL_QUEUE_SIZE = CONCURRENCY * 2
+WORKER_STOP = object()
+
 MONGO_URI = "mongodb://127.0.0.1:27017"
 MONGO_DATABASE = "spider_center"
 MONGO_COLLECTION = "spa5_books1"
@@ -159,6 +162,66 @@ async def scrape_detail(book_id, session, semaphore, collection, stats):
         stats["save_failed"] += 1
 
 
+async def detail_worker(worker_id, queue, session, semaphore, collection, stats):
+    logging.info("detail worker %d started", worker_id)
+
+    while True:
+        book_id = await queue.get()
+
+        try:
+            if book_id is WORKER_STOP:
+                logging.info("detail worker %d stopped", worker_id)
+                return
+
+            await scrape_detail(book_id, session, semaphore, collection, stats)
+        except Exception:
+            stats["worker_errors"] += 1
+            logging.exception(
+                "detail worker %d failed while processing book id=%s",
+                worker_id, book_id
+            )
+        finally:
+            queue.task_done()
+
+
+async def process_detail_queue(books_ids, session, semaphore, collection, stats):
+    queue = asyncio.Queue(maxsize=DETAIL_QUEUE_SIZE)
+    stats["queued"] = len(books_ids)
+
+    workers = [
+        asyncio.create_task(
+            detail_worker(worker_id, queue, session, semaphore, collection, stats),
+            name=f"detail-worker-{worker_id}",
+        )
+        for worker_id in range(1, CONCURRENCY + 1)
+    ]
+
+    try:
+        for book_id in books_ids:
+            await queue.put(book_id)
+
+        for _ in workers:
+            await queue.put(WORKER_STOP)
+
+        await queue.join()
+    finally:
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+
+        workers_result = await asyncio.gather(*workers, return_exceptions=True)
+
+        for result in workers_result:
+            if isinstance(result, Exception):
+                stats["worker_errors"] += 1
+                logging.error("detail worker exited unexpectedly: %r",result)
+
+    logging.info(
+        "detail queue drained queued=%d remaining=%d workers=%d",
+        stats["queued"], queue.qsize(), len(workers),
+    )
+
+
 async def main():
     started_at = time.perf_counter()
     stats = {
@@ -170,6 +233,8 @@ async def main():
         "save_failed": 0,
         "request_retries": 0,
         "retry_exhausted": 0,
+        "queued": 0,
+        "worker_errors": 0,
     }
 
     client = AsyncIOMotorClient(MONGO_URI)
@@ -211,16 +276,7 @@ async def main():
 
             logging.info("collected %d unique books ids", len(books_ids))
 
-            detail_tasks = [
-                scrape_detail(book_id, session, semaphore, collection, stats)
-                for book_id in books_ids
-            ]
-            detail_results = await asyncio.gather(*detail_tasks, return_exceptions=True)
-
-            for result in detail_results:
-                if isinstance(result, Exception):
-                    stats["detail_failed"] += 1
-                    logging.error("detail task failed unexpectedly: %r", result)
+            await process_detail_queue(books_ids, session, semaphore, collection, stats)
 
     finally:
         client.close()
@@ -228,11 +284,12 @@ async def main():
         logging.info(
             "summary | elapsed=%.2fs | index_success=%d | index_failed=%d | "
             "detail_success=%d | detail_failed=%d | saved=%d | save_failed=%d "
-            "| request_retries=%d | retry_exhausted=%d ",
+            "| request_retries=%d | retry_exhausted=%d | queued=%d | worker_errors=%d ",
             elapsed,
             stats["index_success"], stats["index_failed"], stats["detail_success"],
             stats["detail_failed"], stats["saved"], stats["save_failed"],
-            stats["request_retries"], stats["retry_exhausted"],
+            stats["request_retries"], stats["retry_exhausted"],stats["queued"],
+            stats["worker_errors"],
         )
 
 if __name__ == "__main__":
