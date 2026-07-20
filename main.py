@@ -4,9 +4,8 @@ import logging
 import time
 
 import aiohttp
-from bson.errors import BSONError
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import PyMongoError
+
+from storage import MongoStorage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,26 +127,7 @@ async def scrape_index(page, session, semaphore, stats):
     return await scrape_api(url, session, semaphore, stats)
 
 
-async def save_data(data, collection):
-    book_id = data.get("id")
-    if book_id is None:
-        logging.info("skip data without id")
-        return False
-
-    try:
-        await collection.update_one(
-            {"id": book_id},
-            {"$set": data},
-            upsert=True,
-        )
-        logging.info("save data id: %s", book_id)
-        return True
-    except (PyMongoError, BSONError):
-        logging.error("failed to save data id: %s", book_id)
-        return False
-
-
-async def scrape_detail(book_id, session, semaphore, collection, stats):
+async def scrape_detail(book_id, session, semaphore, storage, stats):
     url = DETAIL_URL.format(id=book_id)
     data = await scrape_api(url, session, semaphore, stats)
 
@@ -155,14 +135,15 @@ async def scrape_detail(book_id, session, semaphore, collection, stats):
         stats["detail_failed"] += 1
         return
 
-    stats["detail_success"] += 1
-    if await save_data(data, collection):
+    if await storage.save_data(data):
+        stats["detail_success"] += 1
         stats["saved"] += 1
     else:
+        stats["detail_failed"] += 1
         stats["save_failed"] += 1
 
 
-async def detail_worker(worker_id, queue, session, semaphore, collection, stats):
+async def detail_worker(worker_id, queue, session, semaphore, storage, stats):
     logging.info("detail worker %d started", worker_id)
 
     while True:
@@ -173,7 +154,7 @@ async def detail_worker(worker_id, queue, session, semaphore, collection, stats)
                 logging.info("detail worker %d stopped", worker_id)
                 return
 
-            await scrape_detail(book_id, session, semaphore, collection, stats)
+            await scrape_detail(book_id, session, semaphore, storage, stats)
         except Exception:
             stats["worker_errors"] += 1
             logging.exception(
@@ -184,13 +165,13 @@ async def detail_worker(worker_id, queue, session, semaphore, collection, stats)
             queue.task_done()
 
 
-async def process_detail_queue(books_ids, session, semaphore, collection, stats):
+async def process_detail_queue(books_ids, session, semaphore, storage, stats):
     queue = asyncio.Queue(maxsize=DETAIL_QUEUE_SIZE)
     stats["queued"] = len(books_ids)
 
     workers = [
         asyncio.create_task(
-            detail_worker(worker_id, queue, session, semaphore, collection, stats),
+            detail_worker(worker_id, queue, session, semaphore, storage, stats),
             name=f"detail-worker-{worker_id}",
         )
         for worker_id in range(1, CONCURRENCY + 1)
@@ -237,11 +218,11 @@ async def main():
         "worker_errors": 0,
     }
 
-    client = AsyncIOMotorClient(MONGO_URI)
+    storage = MongoStorage(MONGO_URI, MONGO_DATABASE, MONGO_COLLECTION)
 
     try:
-        db = client[MONGO_DATABASE]
-        collection = db[MONGO_COLLECTION]
+        if not await storage.initialize():
+            raise RuntimeError("MongoDB initialization failed")
 
         semaphore = asyncio.Semaphore(CONCURRENCY)
 
@@ -276,10 +257,10 @@ async def main():
 
             logging.info("collected %d unique books ids", len(books_ids))
 
-            await process_detail_queue(books_ids, session, semaphore, collection, stats)
+            await process_detail_queue(books_ids, session, semaphore, storage, stats)
 
     finally:
-        client.close()
+        storage.close()
         elapsed = time.perf_counter() - started_at
         logging.info(
             "summary | elapsed=%.2fs | index_success=%d | index_failed=%d | "
