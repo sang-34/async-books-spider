@@ -65,14 +65,6 @@ async def collect_book_ids(crawler, stats):
 
         stats["index_success"] += 1
 
-        items = result.get("results")
-        if not isinstance(items, list):
-            stats["index_failed"] += 1
-            logger.warning("index response is missing a valid results list")
-            continue
-
-        stats["index_success"] += 1
-
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -86,14 +78,14 @@ async def collect_book_ids(crawler, stats):
 
 
 async def detail_worker(worker_id, queue, crawler, storage, stats):
-    logging.info("detail worker %d started", worker_id)
+    logger.info("detail worker %d started", worker_id)
 
     while True:
         book_id = await queue.get()
 
         try:
             if book_id is WORKER_STOP:
-                logging.info("detail worker %d stopped", worker_id)
+                logger.info("detail worker %d stopped", worker_id)
                 return
 
             data = await crawler.scrape_detail(book_id)
@@ -150,9 +142,9 @@ async def process_detail_queue(books_ids, crawler, storage, stats):
         for result in workers_result:
             if isinstance(result, Exception):
                 stats["worker_errors"] += 1
-                logging.error("detail worker exited unexpectedly: %r",result)
+                logger.error("detail worker exited unexpectedly: %r",result)
 
-    logging.info(
+    logger.info(
         "detail queue drained queued=%d remaining=%d workers=%d",
         stats["queued"], queue.qsize(), len(workers),
     )
@@ -187,7 +179,7 @@ async def main():
         storage.close()
         
         elapsed = time.perf_counter() - started_at
-        logging.info(
+        logger.info(
             "summary | elapsed=%.2fs | index_success=%d | index_failed=%d | "
             "detail_success=%d | detail_failed=%d | saved=%d | save_failed=%d "
             "| request_retries=%d | retry_exhausted=%d | queued=%d | worker_errors=%d ",
