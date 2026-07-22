@@ -40,10 +40,6 @@ class MongoStorage:
             return False
 
     async def save_data(self, data):
-        if not isinstance(data, dict):
-            logger.error("cannot save non-dict data")
-            return False
-
         book_id = data.get("id")
         if book_id is None:
             logger.error("cannot save data without id")
